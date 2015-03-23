@@ -117,13 +117,18 @@ void usage(ostream& out)
 "       Upload <local-directory> to <rados-pool>\n"
 "   export [options] <rados-pool> <local-directory>\n"
 "       Download <rados-pool> to <local-directory>\n"
-"   options:\n"
+"   options for import and export:\n"
 "       -f / --force                 Copy everything, even if it hasn't changed.\n"
 "       -d / --delete-after          After synchronizing, delete unreferenced\n"
 "                                    files or objects from the target bucket\n"
 "                                    or directory.\n"
 "       --workers                    Number of worker threads to spawn \n"
 "                                    (default " STR(DEFAULT_NUM_RADOS_WORKER_THREADS) ")\n"
+"\n"
+"   dump <rados-pool>\n"
+"       Stream pool contents to standard out\n"
+"   undump <rados-pool>\n"
+"       Load pool contents from standard in\n"
 "\n"
 "ADVISORY LOCKS\n"
 "   lock list <obj-name>\n"
@@ -1128,6 +1133,165 @@ static int do_cache_flush_evict_all(IoCtx& io_ctx, bool blocking)
   }
   return errors ? -1 : 0;
 }
+
+const static uint32_t DUMP_BEGIN = 0x7b961d93;
+const static uint32_t DUMP_END = 0x174735f9;
+
+
+class DumpedObject
+{
+private:
+  std::string oid;
+  std::string nspace;
+  std::string locator;
+  uint64_t size;
+
+  std::map<std::string, bufferlist> xattrs;
+  std::map<std::string, bufferlist> omap;
+  bufferlist omap_header;
+
+public:
+  void encode(bufferlist &bl)
+  {
+    ENCODE_START(1, 1, bl);
+    ::encode(oid, bl);
+    ::encode(nspace, bl);
+    ::encode(locator, bl);
+    ::encode(xattrs, bl);
+    ::encode(omap, bl);
+    ::encode(omap_header, bl);
+    ENCODE_FINISH(bl);
+  }
+  
+  void decode(bufferlist::iterator &bl)
+  {
+    DECODE_START(1, bl);
+    ::decode(oid, bl);
+    ::decode(nspace, bl);
+    ::decode(locator, bl);
+    ::decode(xattrs, bl);
+    ::decode(omap, bl);
+    ::decode(omap_header, bl);
+    DECODE_FINISH(bl);
+  }
+
+  int load(IoCtx &io_ctx, const librados::NObjectIterator &i)
+  {
+    oid = i->get_oid();
+    nspace = i->get_nspace();
+    locator = i->get_locator();
+
+    int ret = io_ctx.omap_get_header(oid, &omap_header);
+    if (ret < 0) {
+      cerr << "error getting omap header " << oid
+	   << ": " << cpp_strerror(ret) << std::endl;
+      return ret;
+    }
+
+    int MAX_READ = 512;
+    string last_read = "";
+    do {
+      map<string, bufferlist> values;
+      ret = io_ctx.omap_get_vals(oid, last_read, MAX_READ, &values);
+      if (ret < 0) {
+	cerr << "error getting omap keys " << oid << ": "
+	     << cpp_strerror(ret) << std::endl;
+	return ret;
+      }
+      ret = values.size();
+      for (map<string, bufferlist>::const_iterator it = values.begin();
+	   it != values.end(); ++it) {
+	last_read = it->first;
+        omap[it->first] = it->second;
+      }
+    } while (ret == MAX_READ);
+    ret = 0;
+
+    ret = io_ctx.getxattrs(oid, xattrs);
+    if (ret < 0) {
+      cerr << "error getting xattr set " << oid << ": " << cpp_strerror(ret)
+           << std::endl;
+      return ret;
+    }
+
+    ret = io_ctx.stat(oid, &size, NULL);
+    if (ret < 0) {
+      cerr << "error statting " << oid << ": " << cpp_strerror(ret)
+           << std::endl;
+      return ret;
+    }
+
+    return ret;
+  }
+
+  int dump_data(IoCtx &io_ctx, std::ostream &out)
+  {
+    uint32_t op_size = 4096 * 1024;
+    uint64_t offset = 0;
+    int ret;
+    while (true) {
+      bufferlist outdata;
+      ret = io_ctx.read(oid, outdata, op_size, offset);
+      if (ret <= 0) {
+        return ret;
+      }
+      outdata.write_stream(out);
+      /* FIXME check for stream error
+      if (ret < 0) {
+        cerr << "error writing to file: " << cpp_strerror(ret) << std::endl;
+        goto out;
+      }
+       */
+      if (outdata.length() < op_size)
+        break;
+      offset += outdata.length();
+    }
+    ret = 0;
+
+    return ret;
+  }
+};
+
+static int do_dump(IoCtx &io_ctx)
+{
+  bufferlist bl_intro;
+  ::encode(DUMP_BEGIN, bl_intro);
+  bl_intro.write_stream(std::cout);
+
+  librados::NObjectIterator i = io_ctx.nobjects_begin();
+  librados::NObjectIterator i_end = io_ctx.nobjects_end();
+  for (; i != i_end; ++i) {
+    DumpedObject obj;
+    int r = obj.load(io_ctx, i);
+    if (r != 0) {
+      std::cerr << "Error loading " << i->get_oid() << std::endl;
+      return r;
+    }
+
+    bufferlist do_bl;
+    obj.encode(do_bl);
+    do_bl.write_stream(std::cout);
+
+    r = obj.dump_data(io_ctx, std::cout);
+    if (r != 0) {
+      std::cerr << "Error fetching data for " << i->get_oid() << std::endl;
+      return r;
+    }
+  }
+
+  bufferlist bl_outro;
+  ::encode(DUMP_END, bl_outro);
+  bl_outro.write_stream(std::cout);
+
+  return 0;
+}
+
+
+static int do_undump(IoCtx &io_ctx)
+{
+
+}
+
 
 /**********************************************
 
@@ -2596,6 +2760,20 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       cerr << "error from cache-try-flush-evict-all: "
 	   << cpp_strerror(ret) << std::endl;
       goto out;
+    }
+  } else if (strcmp(nargs[0], "dump") == 0) {
+    if (!pool_name) {
+      usage_exit();
+    }
+    ret = do_dump(io_ctx);
+    if (ret < 0) {
+      cerr << "error from dump: "
+	   << cpp_strerror(ret) << std::endl;
+      goto out;
+    }
+  } else if (strcmp(nargs[0], "undump") == 0) {
+    if (!pool_name) {
+      usage_exit();
     }
   } else {
     cerr << "unrecognized command " << nargs[0] << "; -h or --help for usage" << std::endl;
