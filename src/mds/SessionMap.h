@@ -194,9 +194,6 @@ private:
   version_t cap_push_seq;        // cap push seq #
   map<version_t, list<MDSInternalContextBase*> > waitfor_flush; // flush session messages
 
-  // Has completed_requests been modified since the last time we
-  // wrote this session out?
-  bool completed_requests_dirty;
 public:
   xlist<Capability*> caps;     // inodes with caps; front=most recently used
   xlist<ClientLease*> leases;  // metadata leases to clients
@@ -231,11 +228,17 @@ public:
 
   // -- completed requests --
 private:
+  // Has completed_requests been modified since the last time we
+  // wrote this session out?
+  bool completed_requests_dirty;
 
+  unsigned num_completed_requests;
+  unsigned num_trim_requests_warnings;
 
 public:
   void add_completed_request(ceph_tid_t t, inodeno_t created) {
     info.completed_requests[t] = created;
+    num_completed_requests++;
     completed_requests_dirty = true;
   }
   bool trim_completed_requests(ceph_tid_t mintid) {
@@ -244,6 +247,7 @@ public:
     while (!info.completed_requests.empty() && 
 	   (mintid == 0 || info.completed_requests.begin()->first < mintid)) {
       info.completed_requests.erase(info.completed_requests.begin());
+      num_completed_requests--;
       erased_any = true;
     }
 
@@ -260,6 +264,11 @@ public:
       *pcreated = p->second;
     return true;
   }
+
+  unsigned get_num_completed_requests() const { return num_completed_requests; }
+  unsigned get_num_trim_requests_warnings() { return num_trim_requests_warnings; }
+  void inc_num_trim_requests_warnings() { ++num_trim_requests_warnings; }
+  void reset_num_trim_requests_warnings() { num_trim_requests_warnings = 0; }
 
   bool has_dirty_completed_requests() const
   {
@@ -278,8 +287,9 @@ public:
     connection(NULL), item_session_list(this),
     requests(0),  // member_offset passed to front() manually
     cap_push_seq(0),
+    lease_seq(0),
     completed_requests_dirty(false),
-    lease_seq(0) { }
+    num_completed_requests(0), num_trim_requests_warnings(0) { }
   ~Session() {
     assert(!item_session_list.is_on_list());
     while (!preopen_out_queue.empty()) {

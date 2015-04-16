@@ -681,6 +681,8 @@ void Session::decode(bufferlist::iterator &p)
 {
   info.decode(p);
 
+  num_completed_requests = info.completed_requests.size();
+
   _update_human_name();
 }
 
