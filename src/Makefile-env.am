@@ -19,6 +19,7 @@ lib_LTLIBRARIES =
 noinst_LTLIBRARIES = 
 noinst_LIBRARIES =
 radoslib_LTLIBRARIES =
+EXTRA_PROGRAMS =
 
 # like bin_PROGRAMS, but these targets are only built for debug builds
 bin_DEBUGPROGRAMS =
@@ -34,6 +35,15 @@ check_PROGRAMS =
 
 # tests scripts will be appended to this
 check_SCRIPTS =
+
+# C/C++ tests that are executed via a check script
+check_SCRIPTPROGRAMS =
+EXTRA_PROGRAMS += $(check_SCRIPTPROGRAMS)
+CLEANFILES += $(check_SCRIPTPROGRAMS)
+
+# automatically build programs which scripts require
+check_SCRIPTS += test/check-scripts-deps.sh
+test/check-scripts-deps.sh: $(check_SCRIPTPROGRAMS)
 
 # python unit tests need to know where the scripts are located
 export PYTHONPATH=$(top_srcdir)/src/pybind
